@@ -1,0 +1,1236 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+// Corrected Firebase imports for React environment
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { Eye, BookOpen, Crown, Edit, Loader, CheckCircle, XCircle, Zap, User, Star, Feather } from 'lucide-react';
+
+// --- CONFIGURATION AND UTILITIES ---
+
+const MAX_ORIGINAL_CHAPTERS = 551; 
+
+// --- START: Vercel/Environment-Specific Configuration Loading (FIXED) ---
+
+// 1. Define standard environment variable names for Vercel/Node.js environment
+// We check if 'process' is defined before trying to access process.env
+let VERCEL_FIREBASE_CONFIG = {};
+if (typeof process !== 'undefined' && process.env) {
+    VERCEL_FIREBASE_CONFIG = {
+        apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
+        authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN,
+        projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID,
+        storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET,
+        messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
+        appId: process.env.REACT_APP_FIREBASE_APP_ID, 
+    };
+}
+
+// 2. Load config: Prefer Canvas Globals, fall back to Vercel ENV
+let firebaseConfig = {};
+let finalAppId = 'default-app-id';
+let initialAuthToken = null;
+
+// Check for Canvas globals (used in the current collaborative environment)
+if (typeof __firebase_config !== 'undefined' && Object.keys(JSON.parse(__firebase_config)).length > 0) {
+    firebaseConfig = JSON.parse(__firebase_config);
+    finalAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+} 
+// Check for Vercel ENV (used after deployment)
+else if (VERCEL_FIREBASE_CONFIG.apiKey) {
+    firebaseConfig = VERCEL_FIREBASE_CONFIG;
+    finalAppId = VERCEL_FIREBASE_CONFIG.projectId || 'default-app-id'; // Use Project ID as a reliable app ID
+} 
+// If neither is found, initialization will fail, but the code won't crash.
+
+const appId = finalAppId;
+
+// --- END: Vercel/Environment-Specific Configuration Loading ---
+
+
+// Mock Constellation Data
+const availableConstellations = [
+    { id: 'uriel', name: 'Demon-like Judge of Fire (Uriel)', description: 'Known for fiery loyalty and justice.' },
+    { id: 'abyss', name: 'Secretive Plotter', description: 'Associated with darkness, planning, and fate manipulation.' },
+    { id: 'fable', name: 'Queen of the Darkest Spring', description: 'Goddess of the Underworld and master of death.' },
+    { id: 'korean', name: 'God of Wine and Ecstasy (Dionysus)', description: 'Loves dramatic narratives and unpredictable chaos.' },
+    { id: 'martial', name: 'Mantis of the Northern Star', description: 'A master of martial arts and swift, clean strikes.' },
+];
+
+// Mock Title Data
+const availableTitles = [
+  // ID 1 is the default equipped title
+  { id: 1, name: "The Reader Who Knows the Footnotes", bonus: { agility: 10, strength: 0, durability: 0, magicPower: 0 } },
+  { id: 2, name: "The Incarnation of the Star Stream", bonus: { magicPower: 10, strength: 0, durability: 0, agility: 0 } },
+  { id: 3, name: "Demon King of Salvation", bonus: { durability: 10, strength: 0, agility: 0, magicPower: 0 } },
+  { id: 4, name: "One Who Has Crossed the Line of Sight of the End", bonus: { agility: 5, strength: 5, durability: 0, magicPower: 0 } }, 
+  { id: 5, name: "Master of Scenario 1", bonus: { strength: 10, durability: 0, agility: 0, magicPower: 0 } },
+  { id: 6, name: "Novice Star-Eater", bonus: { durability: 5, magicPower: 5, strength: 0, agility: 0 } },
+  { id: 7, name: "Protagonist's Companion", bonus: { strength: 5, durability: 5, agility: 5, magicPower: 5 } },
+  { id: 8, name: "One Who Knows the End", bonus: { magicPower: 15, agility: 5, strength: 0, durability: 0 } },
+];
+
+// Reverted: Chapter-based major choices (only Chapter 1 now)
+const majorScenarioChoices = {
+    // Chapter 1 (Initial Choice - Mandatory)
+    '1': [
+        { id: 1, name: "Cunning Exploitation (The Fast Track)", effect: { destiny: -1, karma: 1, fablePotential: 0 } }, // Negative Destiny, Positive Karma (Cunning/Efficiency)
+        { id: 2, name: "Calculated Kindness (The Ally)", effect: { destiny: 1, karma: -1, fablePotential: 0 } },    // Positive Destiny, Negative Karma (Kindness/Intervention)
+    ],
+};
+
+
+// Base Stats and Initial Data
+const BASE_STATS = { strength: 30, durability: 25, agility: 35, magicPower: 40 };
+const BASE_HIDDEN_ATTRIBUTES = { karma: 0, destiny: 0, fablePotential: 0 };
+const DEFAULT_TRANSMIGRATOR_NAME = 'LEE KYUNG'; 
+
+const INITIAL_USER_STATE = {
+  name: DEFAULT_TRANSMIGRATOR_NAME, 
+  currentChapter: 1,
+  stats: BASE_STATS,
+  hiddenAttributes: BASE_HIDDEN_ATTRIBUTES, 
+  titles: [{ 
+    id: 1, 
+    name: availableTitles.find(t => t.id === 1).name, 
+    bonus: availableTitles.find(t => t.id === 1).bonus, 
+    equipped: true 
+  }],
+  sponsorConstellation: null, 
+  // chapterChoices tracks only the choice for chapter 1
+  chapterChoices: { 
+      '1': null, 
+  },
+  gender: 'MALE', 
+};
+
+// Mock Chapter Progression
+const STAT_INCREASE_INTERVAL = 5;
+const TITLE_UNLOCK_INTERVAL = 10;
+const STAT_INCREASE_AMOUNT = 3;
+
+// --- Firebase Initialization and Auth Logic ---
+let db = null;
+let auth = null;
+let app = null;
+
+// Only attempt initialization if the config object is populated (either via Canvas or Vercel ENV)
+if (Object.keys(firebaseConfig).length > 0 && firebaseConfig.projectId) {
+  try {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+    // console.log("Firebase initialized successfully.");
+  } catch (error) {
+    console.error("Firebase initialization failed:", error);
+    // If initialization fails, prevent further attempts.
+    db = null;
+    auth = null;
+  }
+} else {
+    console.warn("Firebase configuration is missing. Data persistence will be unavailable.");
+}
+
+// --- Component for System Block ---
+const SystemBlock = ({ content, title = 'System Message', isLlm = false, sources = [] }) => (
+  <div className={`my-3 p-4 rounded-xl border-2 ${isLlm ? 'border-purple-400 bg-gray-950/80' : 'border-cyan-400 bg-gray-950/70'} shadow-lg text-white mx-auto w-11/12`}>
+    <h4 className={`font-bold mb-2 ${isLlm ? 'text-purple-300' : 'text-cyan-300'}`}>{title}</h4>
+    <pre className="font-mono text-xs md:text-sm whitespace-pre-wrap leading-relaxed text-gray-200">
+      {content}
+    </pre>
+    {sources.length > 0 && (
+      <div className="mt-3 pt-3 border-t border-purple-800">
+        <p className="text-xs text-purple-500 font-semibold mb-1">Source Fables (Grounded):</p>
+        <ul className="text-xs space-y-1">
+          {sources.map((src, index) => (
+            <li key={index}>
+              <a href={src.uri} target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 underline">
+                {src.title}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )}
+  </div>
+);
+
+
+// --- Gemini API Utility ---
+
+const API_MODEL = 'gemini-2.5-flash-preview-09-2025';
+const API_KEY = ""; // Leave empty as per instructions.
+const BASE_URL = `https://generativelanguage.googleapis.com/v1beta/models/${API_MODEL}:generateContent?key=${API_KEY}`;
+
+/**
+ * Calls the Gemini API with exponential backoff.
+ * @param {string} userQuery - The user's query.
+ * @param {string} systemPrompt - Instructions for the model's persona.
+ * @param {boolean} useGrounding - Whether to enable Google Search grounding.
+ * @param {number} maxRetries - Maximum number of retries.
+ * @returns {Promise<{text: string, sources: Array<{uri: string, title: string}>}>}
+ */
+const callGeminiAPI = async (userQuery, systemPrompt, useGrounding = false, maxRetries = 5) => {
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+    };
+
+    if (useGrounding) {
+        payload.tools = [{ "google_search": {} }];
+    }
+
+    let lastError = null;
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const response = await fetch(BASE_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.json();
+                throw new Error(`API call failed with status ${response.status}: ${JSON.stringify(errorBody)}`);
+            }
+
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+
+            if (candidate && candidate.content?.parts?.[0]?.text) {
+                const text = candidate.content.parts[0].text;
+                let sources = [];
+                const groundingMetadata = candidate.groundingMetadata;
+
+                if (useGrounding && groundingMetadata && groundingMetadata.groundingAttributions) {
+                    sources = groundingMetadata.groundingAttributions
+                        .map(attribution => ({
+                            uri: attribution.web?.uri,
+                            title: attribution.web?.title,
+                        }))
+                        .filter(source => source.uri && source.title);
+                }
+
+                return { text, sources };
+            } else {
+                throw new Error("Received empty or malformed response from Gemini API.");
+            }
+        } catch (error) {
+            lastError = error;
+            if (i < maxRetries - 1) {
+                const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    throw new Error(`Gemini API failed after ${maxRetries} attempts: ${lastError.message}`);
+};
+
+
+// --- App Component (Exported directly to avoid compilation error) ---
+
+export default function App() {
+  const [userData, setUserData] = useState(INITIAL_USER_STATE);
+  const [loading, setLoading] = useState(true);
+  const [userId, setUserId] = useState(null);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [newName, setNewName] = useState(INITIAL_USER_STATE.name);
+  const [viewMode, setViewMode] = useState('CHAPTERS'); 
+  const [selectedConstellationId, setSelectedConstellationId] = useState('');
+  
+  // LLM State
+  const [llmLoading, setLlmLoading] = useState(false);
+  const [llmResult, setLlmResult] = useState({ text: '', sources: [] });
+  const [llmError, setLlmError] = useState('');
+  const [llmFeature, setLlmFeature] = useState(''); // Tracks which feature produced the result ('FABLE', 'CONTINUATION')
+
+  // Chapter Key and Choice Retrieval
+  const currentChapterKey = userData.currentChapter.toString();
+  
+  // Reverted: Only Chapter 1 requires a choice
+  const isChapterOne = userData.currentChapter === 1;
+  const choiceRequired = isChapterOne && !userData.chapterChoices?.['1'];
+  const lastChoiceMade = userData.chapterChoices?.['1'];
+  const hasSponsor = !!userData.sponsorConstellation;
+
+  // --- Utility Functions ---
+
+  const calculateBaseStats = (chapter) => {
+    const statIncreases = Math.floor((chapter - 1) / STAT_INCREASE_INTERVAL);
+    return Object.fromEntries(
+      Object.entries(BASE_STATS).map(([key, base]) => [key, base + statIncreases * STAT_INCREASE_AMOUNT])
+    );
+  };
+  
+  // Reverted: calculateHiddenAttributes only considers Chapter 1 choice
+  const calculateHiddenAttributes = useCallback((choices) => {
+      const attributes = { ...BASE_HIDDEN_ATTRIBUTES };
+      
+      const choiceId = choices['1'];
+      const chapterChoices = majorScenarioChoices['1'];
+      const choice = chapterChoices?.find(c => c.id === choiceId);
+      
+      if (choice && choice.effect) {
+          attributes.karma += (choice.effect.karma || 0);
+          attributes.destiny += (choice.effect.destiny || 0);
+          attributes.fablePotential += (choice.effect.fablePotential || 0);
+      }
+      return attributes;
+  }, []);
+
+  const getEquippedTitle = useMemo(() => {
+    return userData.titles.find(t => t.equipped);
+  }, [userData.titles]);
+
+
+  const calculateTotalStats = useMemo(() => {
+    if (!userData || !userData.stats || !userData.titles) return {};
+
+    const base = userData.stats;
+    const equippedTitle = getEquippedTitle;
+    // Ensure bonus object exists and has all keys initialized to 0 if missing
+    const bonus = equippedTitle ? equippedTitle.bonus : {};
+    const effectiveBonus = {
+        strength: bonus.strength || 0,
+        durability: bonus.durability || 0,
+        agility: bonus.agility || 0,
+        magicPower: bonus.magicPower || 0,
+    };
+
+    return {
+      strength: base.strength + effectiveBonus.strength,
+      durability: base.durability + effectiveBonus.durability,
+      agility: base.agility + effectiveBonus.agility,
+      magicPower: base.magicPower + effectiveBonus.magicPower,
+    };
+  }, [userData, getEquippedTitle]);
+  
+  const getEquippedTitleBonus = useMemo(() => {
+    const equippedTitle = getEquippedTitle;
+    if (!equippedTitle) return { strength: 0, durability: 0, agility: 0, magicPower: 0 };
+    return {
+        strength: equippedTitle.bonus.strength || 0,
+        durability: equippedTitle.bonus.durability || 0,
+        agility: equippedTitle.bonus.agility || 0,
+        magicPower: equippedTitle.bonus.magicPower || 0,
+    };
+  }, [getEquippedTitle]);
+  
+  // New utility for gender pronouns
+  const getPronouns = useCallback((type) => {
+    const gender = userData.gender || 'MALE';
+    switch (gender) {
+        case 'FEMALE':
+            return type === 'subject' ? 'She' : type === 'object' ? 'her' : 'hers';
+        case 'NON_BINARY':
+            return type === 'subject' ? 'They' : type === 'object' ? 'them' : 'theirs';
+        case 'MALE':
+        default:
+            return type === 'subject' ? 'He' : type === 'object' ? 'him' : 'his';
+    }
+  }, [userData.gender]);
+
+
+  // --- Persistence & Sync ---
+
+  const getDocRef = useCallback((uid) => {
+    if (!db) return null;
+    // Use the finalAppId variable (which contains the Canvas ID or the Vercel Project ID)
+    return doc(db, `/artifacts/${appId}/users/${uid}/orv_status/data`);
+  }, []);
+
+  const saveUserData = useCallback(async (data) => {
+    if (!db || !userId) return console.error("Database not ready or User ID missing.");
+    try {
+      await setDoc(getDocRef(userId), data, { merge: true });
+      // console.log("User data saved successfully.");
+    } catch (e) {
+      console.error("Error saving document: ", e);
+    }
+  }, [userId, getDocRef]);
+
+  // 1. Firebase Auth and Initialization Effect
+  useEffect(() => {
+    if (!auth) {
+        setLoading(false);
+        return; 
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          // Only attempt signInWithCustomToken if the token exists (i.e., in the Canvas environment)
+          if (typeof initialAuthToken === 'string' && initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            // Otherwise, sign in anonymously (Standard Vercel/Web behavior)
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Authentication failed:", error);
+          setLoading(false);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, [auth]);
+
+  // 2. Firestore Listener Effect (runs after auth is ready)
+  useEffect(() => {
+    // Guard clause for when Firebase connection is impossible (e.g., missing ENV vars on Vercel)
+    if (!db) {
+        setLoading(false);
+        return;
+    }
+
+    if (!userId) return;
+
+    const docRef = getDocRef(userId);
+    if (!docRef) return;
+
+    // Listen for real-time updates
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        // Ensure nested objects are initialized and merge data safely
+        const syncedData = {
+            ...INITIAL_USER_STATE, // Use initial state as fallback structure
+            ...data,
+            // Ensure nested objects are handled (like stats, titles, gender)
+            stats: data.stats || INITIAL_USER_STATE.stats,
+            hiddenAttributes: data.hiddenAttributes || INITIAL_USER_STATE.hiddenAttributes, 
+            titles: data.titles || INITIAL_USER_STATE.titles,
+            chapterChoices: data.chapterChoices || INITIAL_USER_STATE.chapterChoices,
+            gender: data.gender || INITIAL_USER_STATE.gender, 
+        };
+        
+        // Recalculate hidden attributes based on stored Chapter 1 choice
+        const updatedHiddenAttributes = calculateHiddenAttributes(syncedData.chapterChoices);
+        syncedData.hiddenAttributes = updatedHiddenAttributes;
+
+        setUserData(syncedData);
+        setNewName(syncedData.name || DEFAULT_TRANSMIGRATOR_NAME); // Sync editing state
+      } else {
+        // Document does not exist, initialize it
+        const initialStats = calculateBaseStats(INITIAL_USER_STATE.currentChapter);
+        const dataToSave = { ...INITIAL_USER_STATE, stats: initialStats };
+        saveUserData(dataToSave);
+      }
+      setLoading(false);
+    }, (error) => {
+      console.error("Error listening to Firestore:", error);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [userId, getDocRef, saveUserData, calculateHiddenAttributes]);
+
+  // --- LLM Action Handlers ---
+  
+  // Clear LLM results when switching views
+  useEffect(() => {
+      setLlmResult({ text: '', sources: [] });
+      setLlmError('');
+      setLlmFeature('');
+  }, [viewMode, userData.currentChapter]);
+  
+  
+  const handleGenerateFableSummary = async () => {
+      setLlmLoading(true);
+      setLlmError('');
+      setLlmResult({ text: '', sources: [] });
+      setLlmFeature('FABLE');
+      
+      const equippedTitle = getEquippedTitle?.name || "The Reader Who Knows the Footnotes";
+      
+      const userQuery = `Write a dramatic, grand, single-paragraph summary of Incarnation ${userData.name}'s current Fable and its potential narrative trajectory. 
+          The Fable is defined by these core attributes: 
+          - Karma: ${userData.hiddenAttributes.karma} (Measures cunning/efficiency vs. selfless kindness)
+          - Destiny: ${userData.hiddenAttributes.destiny} (Measures adherence to canonical fate vs. narrative disruption)
+          - Fable Potential: ${userData.hiddenAttributes.fablePotential} (Measures raw capability to generate new stories)
+          - Equipped Title: '${equippedTitle}'
+          - Current Chapter: ${userData.currentChapter}
+          
+          Use ancient mythology concepts as inspiration for the tone and scope of this Fable.`;
+          
+      const systemPrompt = "Act as the Star Stream's grand storyteller and archivist, translating the Incarnation's status and attributes into a concise, dramatic Fable summary. Ensure the summary is grounded in real-world myths that parallel the Incarnation's journey.";
+      
+      try {
+          const result = await callGeminiAPI(userQuery, systemPrompt, true); // Use Grounding
+          setLlmResult(result);
+      } catch (e) {
+          console.error("Gemini Fable Generation Error:", e);
+          setLlmError('Fable generation failed. The Star Stream seems to be experiencing a narrative blackout.');
+      } finally {
+          setLlmLoading(false);
+      }
+  };
+  
+  const handleGenerateContinuation = async () => {
+      setLlmLoading(true);
+      setLlmError('');
+      setLlmResult({ text: '', sources: [] });
+      setLlmFeature('CONTINUATION');
+      
+      // Get the last major paragraph of the current chapter's raw text
+      const rawText = getChapterContent(
+        userData.currentChapter, 
+        userData.sponsorConstellation?.name, 
+        userData.chapterChoices, 
+        userData.name,
+        userData.hiddenAttributes
+      ).rawText;
+      
+      // Extract the last non-empty line/paragraph for context
+      const context = rawText.trim().split('\n').filter(line => line.trim()).pop() || 'The silence was deafening.';
+      
+      const userQuery = `The scene just ended with: "${context}". The Incarnation's name is ${userData.name}. The current chapter is ${userData.currentChapter}. Write a dramatic, one-paragraph continuation (max 4 sentences) of this narrative that introduces a sudden, critical problem or a surprise plot twist, forcing the Incarnation to make a snap judgment.`;
+          
+      const systemPrompt = "You are a professional web novel writer for a fantasy regression novel (like ORV). Your job is to create gripping narrative cliffhangers. Write a dramatic continuation of the current scene.";
+      
+      try {
+          const result = await callGeminiAPI(userQuery, systemPrompt, false); // No Grounding needed for creative writing
+          setLlmResult(result);
+      } catch (e) {
+          console.error("Gemini Continuation Generation Error:", e);
+          setLlmError('Scenario continuation failed. The Dokkaebi channel is offline.');
+      } finally {
+          setLlmLoading(false);
+      }
+  };
+
+  // --- Action Handlers (Chapter & Title) ---
+
+  const handleMakeChoice = (chapterKey, choiceId) => {
+    
+    // Find the choice details to apply the effect
+    const majorChoices = majorScenarioChoices[chapterKey];
+    const choice = majorChoices?.find(c => c.id === choiceId);
+    
+    if (!choice) return;
+
+    const newChapterChoices = { 
+        ...userData.chapterChoices, 
+        [chapterKey]: choiceId 
+    };
+
+    // Recalculate hidden attributes with the new choice included
+    const updatedHiddenAttributes = calculateHiddenAttributes(newChapterChoices);
+    
+    const updatedData = { 
+        ...userData, 
+        chapterChoices: newChapterChoices,
+        hiddenAttributes: updatedHiddenAttributes,
+    };
+
+    setUserData(updatedData);
+    saveUserData(updatedData);
+  }
+  
+  const handleGenderChange = (newGender) => {
+    const updatedData = { ...userData, gender: newGender };
+    setUserData(updatedData);
+    saveUserData(updatedData);
+  }
+
+  const handleAdvanceChapter = () => {
+    if (loading) return;
+    
+    // GUARD: Check if the Chapter 1 choice is required
+    if (choiceRequired) {
+        console.warn(`Cannot advance yet. Please make the choice for Chapter 1.`);
+         return;
+    }
+    
+    if (!hasSponsor) {
+         console.warn("Cannot advance yet. Please select a sponsor.");
+         return;
+    }
+    
+    const nextChapter = userData.currentChapter + 1;
+    let newTitles = [...userData.titles];
+    let showTitleMessage = false;
+    
+    // Check for stat increase (which is tied to chapter progression)
+    const newStats = calculateBaseStats(nextChapter);
+
+    // Check for new title unlock
+    if (nextChapter > userData.currentChapter && nextChapter % TITLE_UNLOCK_INTERVAL === 0) {
+      // Logic to cycle through availableTitles array
+      // Find the index of the next unlockable title in the main list
+      const titleIndexToUnlock = availableTitles.findIndex(t => t.id === (Math.floor(nextChapter / TITLE_UNLOCK_INTERVAL) + 1));
+      
+      const newTitleData = availableTitles[titleIndexToUnlock];
+      
+      if (newTitleData && !newTitles.some(t => t.id === newTitleData.id)) {
+        newTitles.push({ ...newTitleData, equipped: false });
+        showTitleMessage = true;
+      }
+    }
+
+    const updatedData = {
+      ...userData,
+      currentChapter: nextChapter,
+      stats: newStats,
+      titles: newTitles,
+    };
+
+    setUserData(updatedData);
+    saveUserData(updatedData);
+
+    if (showTitleMessage) {
+        // Find the name of the newly unlocked title for the message
+        const newlyUnlockedTitle = newTitles.find(t => t.id === (Math.floor(nextChapter / TITLE_UNLOCK_INTERVAL) + 1));
+        const titleName = newlyUnlockedTitle ? newlyUnlockedTitle.name : "A new title";
+        console.log(`🎉 NEW TITLE UNLOCKED! Check your Status Panel to equip it: ${titleName}`);
+    }
+  };
+
+  const handleEquipTitle = (titleId) => {
+    const updatedTitles = userData.titles.map(t => ({
+      ...t,
+      equipped: t.id === titleId,
+    }));
+    const updatedData = { ...userData, titles: updatedTitles };
+    setUserData(updatedData);
+    saveUserData(updatedData);
+  };
+
+  const handleEditName = () => {
+    if (isEditingName) {
+      // Ensure the name is trimmed and capitalized for the Status Panel
+      const newNameClean = newName.toUpperCase().trim() || DEFAULT_TRANSMIGRATOR_NAME;
+      const updatedData = { ...userData, name: newNameClean };
+      setUserData(updatedData);
+      saveUserData(updatedData);
+    }
+    setIsEditingName(!isEditingName);
+  };
+
+  const handleSelectConstellation = () => {
+    const selectedConstellation = availableConstellations.find(c => c.id === selectedConstellationId);
+    if (!selectedConstellation) return;
+
+    const updatedData = { ...userData, sponsorConstellation: selectedConstellation };
+    setUserData(updatedData);
+    saveUserData(updatedData);
+  }
+
+  // Helper function to render text with newlines as paragraphs
+  const renderNovelText = (rawText) => {
+      // Split by double newline to get distinct paragraphs
+      return rawText.split(/\n\s*\n/).map((paragraph, index) => {
+          // If the paragraph is empty, skip it.
+          if (!paragraph.trim()) return null;
+          
+          // Use SystemBlock for text enclosed in {{{...}}}
+          if (paragraph.startsWith('{{{') && paragraph.endsWith('}}}')) {
+              const content = paragraph.substring(3, paragraph.length - 3).trim();
+              return <SystemBlock key={index} content={content} />;
+          }
+          
+          // Split by single newline to retain soft breaks within the text
+          const lines = paragraph.split('\n').map((line, lineIndex) => (
+              <React.Fragment key={lineIndex}>
+                  {line.trim()}
+                  {lineIndex < paragraph.split('\n').length - 1 && <br />}
+              </React.Fragment>
+          ));
+          
+          return (
+              <p key={index} className="mb-4 text-gray-300 leading-relaxed indent-4">
+                  {lines}
+              </p>
+          );
+      }).filter(Boolean); // Filter out any null returns (empty paragraphs)
+  };
+
+  // --- Content Generation Function (Simplified to return raw text) ---
+
+  const getChapterContent = (chapter, constellationName, choices, transmigratorName, hiddenAttributes) => {
+      const storyType = chapter > MAX_ORIGINAL_CHAPTERS ? 'Light Novel (Epilogue)' : 'Original Novel';
+      
+      let chapterTitle = `Chapter ${chapter}: Navigating the Mid-Scenarios`;
+      let rawText = '';
+      let illustrationText = transmigratorName + ', standing at the precipice of a new scenario.';
+      let scenarioNumber = Math.ceil(chapter / 50);
+      let scenarioName = `Scenario [${scenarioNumber}]`;
+      const sponsor = constellationName || 'Unknown Sponsor';
+      const transmigrator = transmigratorName; 
+      const pronoun = getPronouns('subject');
+      const objPronoun = getPronouns('object');
+      const possPronoun = getPronouns('object');
+      
+      // Impact of Chapter 1's choice
+      const initialChoiceId = choices['1'];
+      const choiceImpact1 = initialChoiceId === 1 
+          ? 'a clean, coin-optimized start, maximizing early advantage' 
+          : 'a risky intervention that secured the trust of Incarnation Lee Hyunsung.';
+          
+      // Removed Chapter 10 and Chapter 20 specific content logic
+
+      if (chapter === 1) {
+          // --- CHAPTER 1: THE PROLOGUE (REVERTED - CUNNING READER FOCUS) ---
+          chapterTitle = `Chapter 1: The First Variable (The Cunning of the Reader)`;
+          illustrationText = `${transmigrator}, with a knowing expression, looking at the culling monster.`;
+          
+          rawText = `
+              The final sentence of «Three Ways to Survive in a Ruined World» had just filled ${possPronoun} phone screen. The Dokkaebi's grating voice cut through the air, announcing the inevitable, cruel scenario.
+
+              "Everyone, look at your heads! Kill what is closest, or you die!"
+
+              Panic erupted. The subway car dissolved into chaos as the first culling monster, a small but deadly creature, appeared. People screamed, but I remained perfectly still, my mind racing through the footnotes of the 3,149-chapter novel I alone had finished.
+
+              *I know the optimal path. The goal isn't just to survive; it's to thrive, to guide this tragedy toward a better ending.* My knowledge is my Stigma.
+              
+              [[The free service of the Star Stream has ended. The main scenario is now beginning.]]
+              
+              {{{
+              Main Scenario #1 – The Prologue
+              Category: Main
+              Goal: Kill one or more living things. (Living creatures can be any life form)
+              Time Limit: 30 minutes
+              Compensation: 300 coins.
+              Mandatory Rule: Participation is compulsory.
+              }}}
+              
+              The creature charged, heading toward the nearest, most panicked victim. I knew exactly where the second, weaker target would materialize, the one Kim Dokja would typically use. I had to exploit that knowledge before the protagonist himself arrived.
+          `;
+          
+          if (initialChoiceId === 1) {
+              rawText += `
+                  // OUTCOME: Cunning Exploitation (Coin Optimization).
+                  I moved not toward the main monster, but toward the corner where a tiny, nearly invisible insect was already dying from the change in air pressure—a detail only mentioned in a footnote. I swiftly dispatched the creature with a single, brutal stomp, fulfilling the scenario requirement with zero physical risk.
+                  
+                  [[You have fulfilled the Main Scenario requirement. Compensation secured. Hidden Compensation: Attribute Increase (Agility +2) due to 'Extreme Efficiency'. The Star Stream demands a faster performance from ${objPronoun}. (Karma: +1, Destiny: -1)]]
+                  
+                  I used the remaining time to tend to a few minor injuries on nearby survivors, offering aid where I could to minimize suffering. The immediate threat was gone, replaced by the profound, anxious understanding that I was now truly a part of the novel. I had used my knowledge not for power, but for a clean start.
+              `;
+          } else if (initialChoiceId === 2) {
+              rawText += `
+                  // OUTCOME: Calculated Kindness (Securing an Early Ally).
+                  I ignored the easiest kill. Instead, I grabbed the heavy tool kit that usually served as the main character's first weapon and hurled it, not at the monster, but at the feet of the frozen soldier, Lee Hyunsung.
+                  
+                  "Soldier Lee Hyunsung! Use this to create distance! Protect the girl behind you!" I shouted.
+                  
+                  The soldier, snapped into action by the directive, instinctively used the kit to fend off the monster's attention. I used that moment of distraction to secure my own minimum kill, but the real reward was the soldier's respect.
+                  
+                  [[You have fulfilled the Main Scenario requirement. Hidden Compensation: Affinity with Incarnation 'Lee Hyunsung' increased. The soldier's faith is now directed toward ${objPronoun}. (Karma: -1, Destiny: +1)]]
+                  
+                  The main monster was eventually dispatched by the combined efforts of the remaining stronger survivors. The scenario closed, and I had secured my first reliable ally, a crucial investment in my long-term goal of a happy ending.
+              `;
+          }
+           // --- END OF TRANSMIGRATION NARRATIVE FOCUS ---
+
+      } else if (chapter === 2) {
+          // ... (Chapter 2 content remains similar, referencing the initial choice)
+          chapterTitle = `Chapter 2: Aftermath and Coin Allocation (The Peaceful Start)`;
+          illustrationText = `${transmigrator} scrutinizing ${possPronoun} coin balance, pleased with the clean execution.`;
+          rawText = `
+              The Star Stream's chime confirmed the end of the Prologue, and the air was still, quiet. The scenario execution had been unusually peaceful, a testament to my quick thinking and adherence to the novel's obscure details.
+
+              *Phase Two: Preparation.* I leaned against a seat, my adrenaline crash starting. I needed to allocate my coins and skills carefully. My early intervention secured me ${choiceImpact1}, a crucial advantage over the canonical start.
+              
+              [[Incarnation '${transmigrator}' has completed Main Scenario #1. Total Coins Earned: 350 (including Efficiency Bonus).]]
+              
+              *The next bottleneck is the first batch of sponsored skills.* I focused my attention on the remaining survivors. Lee Hyunsung, the soldier, was gathering his wits. ${initialChoiceId === 2 ? 
+                  '*He looked at me with deep trust. The shield is secured.*' : 
+                  '*He looked at me with cautious curiosity. My actions were precise, almost mechanical.*'}
+              
+              I decided to prioritize knowledge and the next crucial objective. I spent a small amount of coins to enhance my **Magic Power** attribute, knowing I needed mental fortitude to access the deeper levels of the novel's lore and set up the protagonist for success.
+              
+              [[Constellation '${sponsor}' urges you to 'Stop being so quiet! Where's the drama?!' They believe this is peak drama.]]
+          `;
+      } else if (chapter === 5) {
+          // --- CHAPTER 5: THE TRUE PROTAGONIST'S ARRIVAL ---
+          chapterTitle = `Chapter 5: Protagonist Meets Anomaly (First Contact with Kim Dokja)`;
+          illustrationText = `Kim Dokja and ${transmigrator} locking eyes on the empty subway tracks, both sensing the narrative discrepancy.`;
+          rawText = `
+              It was inevitable. Despite my attempts to maintain distance, my path converged with the true protagonist's. Kim Dokja was there, looking exhausted but determined, already accompanied by the young Incarnation, Yoo Sangah. ${pronoun} had just completed ${possPronoun} canonical start, but ${possPronoun} expression was troubled.
+              
+              ${pronoun} turned, ${possPronoun} eyes narrowing, not at my stats, but at the sheer *lack of expected chaos* surrounding me. ${pronoun} sensed a massive anomaly.
+              
+              "Who are you?" Kim Dokja asked, ${possPronoun} voice low and suspicious. "The scenario feels... clean. Too clean. The first section should have been far more chaotic."
+              
+              I offered a polite, slightly too-knowing smile—the ultimate fan-service. "I am Incarnation ${transmigrator}. I merely read the fine print of the rules, Dokja-ssi. Sometimes, the best strategy is the one that avoids unnecessary tragedy. My early choices have already secured ${choiceImpact1}."
+              
+              The subtle tension was broken by the quiet arrival of a figure I had momentarily forgotten about: **Yoo Joonghyuk**, the Regressor. He wasn't hostile, but intensely observant, studying the scene of the unusual lack of chaos.
+              
+              I had successfully established myself as the stabilizing factor. The Star Stream will keep us together now, eager to see how the reader, the anomaly, and the Regressor interact. The three key players of the novel were now on the same platform, far earlier than they should have been.
+              
+              [[Constellation '${sponsor}' urges you to 'Don't fight! Get the popcorn!' They believe this is peak drama.]]
+          `;
+      } else if (chapter > MAX_ORIGINAL_CHAPTERS) {
+          // ... (Epilogue content remains the same)
+          chapterTitle = `Chapter 552: Fragment of the True Epilogue (Part ${chapter - MAX_ORIGINAL_CHAPTERS}) [Fanfic Ending]`;
+          illustrationText = `${transmigrator}'s Company gathered near the shattered Fourth Wall.`;
+          rawText = `
+              The final boundary had been crossed, the novel ended, and my journey as ${transmigrator} was complete. The distinction between reader and character was gone. I looked at my companions: the original protagonist, Kim Dokja, finally free from the constraints of his own narrative, and the Regressor, Yoo Joonghyuk, whose eyes no longer held the endless cycle of despair.
+              
+              [[The Fable, 'The One Who Rewrote the Ending,' is satisfied. It demands rest.]]
+              
+              The message was internal, echoing my own profound exhaustion. *I was the story now, but it was a story I had helped shape.*
+              
+              "Kyung-ssi," Kim Dokja said, offering a weary smile. "You really knew how to cheat the system, didn't you? Your choices led to a total Karma of ${hiddenAttributes.karma}, a destiny score of ${hiddenAttributes.destiny}, and a Fable Potential of ${hiddenAttributes.fablePotential}. You truly carved your own path."
+              
+              I smiled back. "I used the footnotes, Dokja-ssi. You might have been the main fan, but I was the one who wrote the wiki. And sometimes, the best strategy is the one that avoids unnecessary tragedy. I ensured the kind ending was achieved through cunning means."
+              
+              [[Constellation '${sponsor}' is shedding tears of profound narrative satisfaction.]]
+          `;
+      } else {
+          // --- Generic Mid-Scenario Content ---
+          chapterTitle = `Chapter ${chapter}: Scenario Progression - Seeking New Fables`;
+          illustrationText = `${transmigrator} navigating the complex rules of Scenario ${scenarioNumber}.`;
+          rawText = `
+              We are deep within ${scenarioName}, a realm where concepts held more weight than physical reality. The Star Stream continues to escalate the challenges, forcing us to adapt and innovate with every step.
+              
+              "Focus the core Fable on the left flank! We need to stabilize our narrative position!" I yelled, dodging a massive burst of *Myth-Grade Fable* that evaporated the ground where I stood a second earlier. My mind was running three steps ahead, calculating the causality loops using the forgotten details of the novel.
+
+              [[Current Fable Alignment: Karma (${hiddenAttributes.karma}) | Destiny (${hiddenAttributes.destiny}) | Fable Potential (${hiddenAttributes.fablePotential}). Your Chapter 1 choice determines your core narrative bias.]]
+              
+              The protagonist, Yoo Joonghyuk, landed beside me, ${possPronoun} coat billowing, radiating controlled fury. "Your plan is risky, ${transmigrator}. Why rely on the footnotes when overwhelming strength is available?"
+              
+              "Because, Regressor," I countered, utilizing my own low-tier skills, "I intend to reach the true ending, not just another cycle. I must ensure the protagonist's narrative is secure, even if ${getPronouns('subject').toLowerCase()} fights me on strategy."
+              
+              [[Constellation '${sponsor}' is demanding a better show! They send a minimal coin donation (50 coins).]]
+          `;
+      }
+      
+      // Return chapter content data
+      return { chapterTitle, illustrationText, rawText, storyType };
+  };
+
+    const chapterData = getChapterContent(
+        userData.currentChapter, 
+        userData.sponsorConstellation?.name, 
+        userData.chapterChoices, 
+        userData.name,
+        userData.hiddenAttributes
+    );
+
+    // Determines which set of choices to show (only major decision points)
+    // Reverted: Only show choices if it's Chapter 1 and no choice has been made
+    const currentMajorChoices = isChapterOne ? majorScenarioChoices : null;
+
+
+  // --- Main Component Render ---
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white font-inter p-4 md:p-8">
+      <style jsx="true">{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        .font-inter { font-family: 'Inter', sans-serif; }
+        .neon-blue { color: #00ffff; text-shadow: 0 0 5px #00ffff, 0 0 10px #00aaff; }
+        .stat-bar { height: 8px; background-color: #4b5563; border-radius: 9999px; overflow: hidden; }
+        .stat-fill { transition: width 0.5s ease-out; }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background-color: #4b5563;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background-color: #1f2937;
+        }
+      `}</style>
+      
+      {/* Header and User Status Card - TITLE CHANGE HERE */}
+      <div className="bg-gray-800/70 p-4 rounded-xl shadow-2xl mb-6 border-t-2 border-cyan-500">
+        <h1 className="text-3xl font-bold text-cyan-400 mb-2 flex items-center">
+          <BookOpen className="w-6 h-6 mr-3" />
+          Nexus Path: Transmigrator Status
+        </h1>
+        <p className="text-sm text-gray-400 mb-4">
+            {/* IMPORTANT: Display the full userId */}
+            Transmigrator ID: <span className="font-mono text-xs text-gray-500">{userId || 'Loading...'}</span>
+        </p>
+        
+        {/* Navigation Tabs */}
+        <div className="flex space-x-2 border-b border-gray-700 mb-4">
+            <button 
+                onClick={() => setViewMode('CHAPTERS')} 
+                className={`py-2 px-4 rounded-t-lg text-sm font-medium transition-colors ${viewMode === 'CHAPTERS' ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:bg-gray-700'}`}
+            >
+                <Eye className="w-4 h-4 inline-block mr-2" /> Novel View
+            </button>
+            <button 
+                onClick={() => setViewMode('STATUS')} 
+                className={`py-2 px-4 rounded-t-lg text-sm font-medium transition-colors ${viewMode === 'STATUS' ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:bg-gray-700'}`}
+            >
+                <Crown className="w-4 h-4 inline-block mr-2" /> Status Panel
+            </button>
+            <button 
+                onClick={() => setViewMode('SPONSOR')} 
+                className={`py-2 px-4 rounded-t-lg text-sm font-medium transition-colors ${viewMode === 'SPONSOR' ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:bg-gray-700'}`}
+            >
+                <Zap className="w-4 h-4 inline-block mr-2" /> Sponsor Selection
+            </button>
+        </div>
+        
+        <div className="flex justify-between items-center text-sm">
+            <p className="text-gray-300">
+                <span className="font-semibold text-white">Current Chapter:</span> {userData.currentChapter} / {MAX_ORIGINAL_CHAPTERS}
+                <span className="text-xs text-gray-500 ml-2">({chapterData.storyType})</span>
+            </p>
+            <button 
+                onClick={handleAdvanceChapter}
+                disabled={loading || !hasSponsor || choiceRequired}
+                className={`px-4 py-2 text-sm font-semibold rounded-lg transition-all ${
+                    loading ? 'bg-gray-600 cursor-not-allowed' : 
+                    !hasSponsor || choiceRequired ? 'bg-red-800 text-white opacity-50 cursor-not-allowed' :
+                    'bg-red-700 hover:bg-red-600 shadow-md shadow-red-900/50'
+                }`}
+            >
+                {loading ? <Loader className="w-4 h-4 animate-spin inline mr-2" /> : 'Advance Scenario'}
+            </button>
+        </div>
+      </div>
+
+
+      {/* --- CONTENT AREA: NOVEL VIEW --- */}
+      {viewMode === 'CHAPTERS' && (
+        <div className="bg-gray-900/90 backdrop-blur-sm p-4 md:p-6 rounded-xl shadow-2xl border-2 border-gray-700">
+            <div className="text-center mb-6">
+                <p className="text-xs text-yellow-500 italic mb-1">Illustration: {chapterData.illustrationText}</p>
+                <h2 className="text-2xl md:text-4xl font-extrabold neon-blue tracking-wider">{chapterData.chapterTitle}</h2>
+            </div>
+            
+            {/* Novel Text Area (Simplified Rendering) */}
+            <div className="max-h-[60vh] overflow-y-auto pr-2 custom-scrollbar">
+                {loading ? (
+                    <p className="text-center text-gray-500 mt-10"><Loader className="w-6 h-6 animate-spin inline mr-2" /> Loading Star Stream...</p>
+                ) : (
+                     renderNovelText(chapterData.rawText) // Uses the defined renderNovelText function
+                )}
+                
+                {/* LLM Continuation Output */}
+                {llmFeature === 'CONTINUATION' && (
+                    <>
+                        {llmLoading && (
+                             <p className="text-center text-purple-400 mt-4"><Feather className="w-5 h-5 animate-bounce inline mr-2" /> Star Stream is drafting a twist...</p>
+                        )}
+                        {llmError && (
+                            <SystemBlock 
+                                title="[Narrative Error]"
+                                content={llmError} 
+                                isLlm={true}
+                            />
+                        )}
+                        {llmResult.text && (
+                            <SystemBlock 
+                                title="[Narrative Twist from Star Stream's Core]"
+                                content={llmResult.text} 
+                                isLlm={true}
+                            />
+                        )}
+                    </>
+                )}
+                
+                {/* Fallback for when Firebase is explicitly missing config */}
+                {!db && !loading && (
+                    <div className="text-center p-4 bg-red-900/50 rounded-lg border border-red-400 mt-6">
+                        <p className="text-red-300 font-semibold">
+                            <XCircle className="w-5 h-5 mr-2 inline" />
+                            Firebase is not initialized. Data persistence is unavailable.
+                        </p>
+                    </div>
+                )}
+            </div>
+            
+            <div className="mt-6 pt-4 border-t border-gray-700">
+                {/* Gemini Scenario Continuation Button */}
+                <button
+                    onClick={handleGenerateContinuation}
+                    disabled={llmLoading || !hasSponsor || choiceRequired}
+                    className={`w-full py-3 rounded-lg text-lg font-semibold transition-all shadow-xl flex items-center justify-center ${
+                        llmLoading ? 'bg-purple-800 opacity-70 cursor-wait' :
+                        !hasSponsor || choiceRequired ? 'bg-gray-600 opacity-50 cursor-not-allowed' :
+                        'bg-purple-700 hover:bg-purple-600 shadow-purple-900/70'
+                    }`}
+                >
+                    {llmLoading ? <Loader className="w-5 h-5 animate-spin mr-2" /> : <Feather className="w-5 h-5 mr-2" />}
+                    ✨ Request Scenario Continuation
+                </button>
+            </div>
+
+            {/* Major Decision Point Choices */}
+            {currentMajorChoices && !lastChoiceMade && hasSponsor && isChapterOne && (
+                <div className="mt-8 pt-4 border-t border-gray-700">
+                    <h3 className="text-lg font-semibold text-yellow-400 mb-4">Major Decision: Scenario Choice #1 (Character Foundation)</h3>
+                    <div className="space-y-4">
+                        {currentMajorChoices['1'].map((choice) => (
+                            <button 
+                                key={choice.id}
+                                onClick={() => handleMakeChoice(currentChapterKey, choice.id)} 
+                                className="w-full text-left p-4 rounded-lg bg-gray-700 hover:bg-cyan-800/80 transition-all shadow-md border-l-4 border-cyan-400"
+                            >
+                                <span className="font-bold text-cyan-300">{choice.name}</span><br/>
+                                <span className="text-sm text-gray-300">
+                                    Effect: 
+                                    {choice.effect.karma && <span className={`ml-2 ${choice.effect.karma > 0 ? 'text-green-300' : 'text-red-300'}`}>Karma {choice.effect.karma > 0 ? `+${choice.effect.karma}` : choice.effect.karma}</span>}
+                                    {choice.effect.destiny && <span className={`ml-2 ${choice.effect.destiny > 0 ? 'text-green-300' : 'text-red-300'}`}>Destiny {choice.effect.destiny > 0 ? `+${choice.effect.destiny}` : choice.effect.destiny}</span>}
+                                    {choice.effect.fablePotential && <span className={`ml-2 ${choice.effect.fablePotential > 0 ? 'text-green-300' : 'text-red-300'}`}>Fable Potential {choice.effect.fablePotential > 0 ? `+${choice.effect.fablePotential}` : choice.effect.fablePotential}</span>}
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
+            
+            {/* Completion / Restriction Message */}
+            {lastChoiceMade && hasSponsor && (
+                <div className="mt-6 text-center p-4 bg-green-900/50 rounded-lg border border-green-400">
+                    <p className="text-green-300 font-semibold flex items-center justify-center">
+                        <CheckCircle className="w-5 h-5 mr-2" />
+                        Decision Made: Ready to Advance Scenario.
+                    </p>
+                </div>
+            )}
+            {(!hasSponsor || choiceRequired) && db && (
+                 <div className="mt-6 text-center p-4 bg-red-900/50 rounded-lg border border-red-400">
+                    <p className="text-red-300 font-semibold flex items-center justify-center">
+                        <XCircle className="w-5 h-5 mr-2" />
+                        Mandatory Selection Required: {!hasSponsor ? 'Sponsor Selection Required' : `Scenario Choice for Chapter 1 Required`}
+                    </p>
+                </div>
+            )}
+
+        </div>
+      )}
+
+
+      {/* --- CONTENT AREA: STATUS PANEL --- */}
+      {viewMode === 'STATUS' && (
+        <div className="bg-gray-900/90 backdrop-blur-sm p-4 md:p-6 rounded-xl shadow-2xl border-2 border-gray-700">
+          <h2 className="text-3xl font-bold text-yellow-400 mb-6 flex items-center">
+            <Crown className="w-6 h-6 mr-3" /> Incarnation Status Panel
+          </h2>
+
+          {/* Basic Info */}
+          <div className="mb-8 border-b border-gray-700 pb-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xl font-semibold text-white">Name: {userData.name}</span>
+              <button onClick={handleEditName} className="p-2 bg-gray-700 rounded-full hover:bg-gray-600 transition-colors">
+                <Edit className="w-4 h-4 text-cyan-400" />
+              </button>
+            </div>
+            {isEditingName && (
+              <div className="flex mt-2">
+                <input
+                  type="text"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  className="flex-grow p-2 rounded-l-lg bg-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                  placeholder="Enter new name (e.g., Lee Kyung)"
+                />
+                <button onClick={handleEditName} className="p-2 bg-cyan-600 rounded-r-lg hover:bg-cyan-500 font-semibold">
+                    {isEditingName ? 'Save' : 'Edit'}
+                </button>
+              </div>
+            )}
+            <p className="text-gray-400">Sponsor: {userData.sponsorConstellation?.name || 'Awaiting Selection'}</p>
+            <p className="text-gray-400">Chapter: {userData.currentChapter} (Base Stats Increased: +{Math.floor((userData.currentChapter - 1) / STAT_INCREASE_INTERVAL) * STAT_INCREASE_AMOUNT})</p>
+            
+            {/* Gender Selection */}
+            <div className="mt-4">
+                <h4 className="text-lg font-semibold text-cyan-400 flex items-center mb-2">
+                    <User className="w-4 h-4 mr-2" /> Incarnation Identity
+                </h4>
+                <div className="flex space-x-2">
+                    {['MALE', 'FEMALE', 'NON_BINARY'].map(g => (
+                        <button
+                            key={g}
+                            onClick={() => handleGenderChange(g)}
+                            className={`p-2 rounded-lg text-sm font-medium transition-colors border ${
+                                userData.gender === g
+                                    ? 'bg-cyan-600 border-cyan-400 text-white shadow-lg'
+                                    : 'bg-gray-700 border-gray-600 text-gray-300 hover:bg-gray-600'
+                            }`}
+                        >
+                            {g.replace('_', ' ')}
+                        </button>
+                    ))}
+                </div>
+            </div>
+          </div>
+          
+          {/* Hidden Attributes - Kept to reflect the Chapter 1 choice impact */}
+          <h3 className="text-2xl font-semibold text-purple-400 mb-4 flex items-center">
+            <Star className="w-5 h-5 mr-2" /> Hidden Attributes (Chapter 1 Alignment)
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+              {Object.entries(userData.hiddenAttributes).map(([key, value]) => (
+                  <div key={key} className="bg-gray-800 p-3 rounded-lg flex flex-col items-center shadow-inner">
+                      <span className="text-xs uppercase tracking-wider text-gray-400">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                      <span className={`text-3xl font-extrabold mt-1 ${value >= 0 ? 'text-green-400' : 'text-red-400'}`}>{value}</span>
+                  </div>
+              ))}
+          </div>
+
+          {/* Gemini Fable Summary Output */}
+          <h3 className="text-2xl font-semibold text-pink-400 mb-4 flex items-center border-t border-gray-700 pt-4">
+              <Feather className="w-5 h-5 mr-2" /> Grand Fable Summary
+          </h3>
+          <div className="space-y-4 mb-8">
+              <button
+                  onClick={handleGenerateFableSummary}
+                  disabled={llmLoading}
+                  className={`w-full py-2 rounded-lg text-sm font-semibold transition-all flex items-center justify-center ${
+                      llmLoading ? 'bg-pink-800 opacity-70 cursor-wait' :
+                      'bg-pink-700 hover:bg-pink-600 shadow-md shadow-pink-900/50'
+                  }`}
+              >
+                  {llmLoading ? <Loader className="w-4 h-4 animate-spin mr-2" /> : <Feather className="w-4 h-4 mr-2" />}
+                  ✨ Analyze & Summarize Fable
+              </button>
+              
+              {llmFeature === 'FABLE' && (
+                  <>
+                      {llmLoading && (
+                           <p className="text-center text-pink-400"><Loader className="w-5 h-5 animate-spin inline mr-2" /> Archiving narrative concepts...</p>
+                      )}
+                      {llmError && (
+                          <SystemBlock 
+                              title="[Fable Archive Error]"
+                              content={llmError} 
+                              isLlm={true}
+                          />
+                      )}
+                      {llmResult.text && (
+                          <SystemBlock 
+                              title={`[Fable: ${getEquippedTitle?.name || 'A New Narrative'}]`}
+                              content={llmResult.text} 
+                              isLlm={true}
+                              sources={llmResult.sources}
+                          />
+                      )}
+                  </>
+              )}
+          </div>
+          
+
+          {/* Attributes */}
+          <h3 className="text-2xl font-semibold text-cyan-400 mb-4 border-t border-gray-700 pt-4">Attributes</h3>
+          <div className="space-y-4">
+            {Object.entries(calculateTotalStats).map(([stat, totalValue]) => {
+              const baseValue = userData.stats[stat];
+              const bonusValue = getEquippedTitleBonus[stat];
+              const bonusDisplay = bonusValue > 0 ? (
+                <span className="text-green-400 text-sm italic ml-2">(+{bonusValue})</span>
+              ) : null;
+              
+              // Max total value for display bar (arbitrary cap for visualization)
+              const maxStatValue = 100;
+              const displayWidth = Math.min(100, (totalValue / maxStatValue) * 100);
+
+              return (
+                <div key={stat} className="flex items-center">
+                  <span className="w-32 capitalize text-lg font-medium text-gray-300">{stat}:</span>
+                  <div className="flex-grow mr-4">
+                    <div className="stat-bar">
+                      <div className="stat-fill bg-cyan-500" style={{ width: `${displayWidth}%` }}></div>
+                    </div>
+                  </div>
+                  <span className="text-xl font-bold text-white w-10 text-right">{totalValue}</span>
+                  {bonusDisplay}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Titles */}
+          <h3 className="text-2xl font-semibold text-yellow-400 mt-8 mb-4 border-t border-gray-700 pt-4">Titles</h3>
+          <div className="space-y-3">
+            {userData.titles.map(title => (
+              <div key={title.id} className="flex flex-col md:flex-row items-start md:items-center justify-between p-3 rounded-lg bg-gray-800/50 border border-gray-700 shadow-md">
+                <div className="flex items-start md:items-center mb-2 md:mb-0">
+                  <span className={`text-lg font-medium ${title.equipped ? 'text-yellow-300' : 'text-gray-300'} flex items-center`}>
+                    {title.equipped ? <Crown className="w-5 h-5 inline-block mr-2 text-yellow-400 shrink-0" /> : <BookOpen className="w-5 h-5 inline-block mr-2 text-gray-500 shrink-0" />}
+                    {title.name}
+                  </span>
+                  {/* Display Bonus Stats */}
+                  <span className="text-xs text-cyan-400 ml-4 p-1 bg-gray-700 rounded-md whitespace-nowrap">
+                    {Object.entries(title.bonus).filter(([, val]) => val > 0).map(([key, val]) => `${key.substring(0, 1).toUpperCase()}: +${val}`).join(', ')}
+                  </span>
+                </div>
+                <button
+                  onClick={() => handleEquipTitle(title.id)}
+                  disabled={title.equipped}
+                  className={`px-3 py-1 text-sm font-semibold rounded-full transition-colors ${
+                    title.equipped 
+                      ? 'bg-green-700 text-white cursor-default opacity-80' 
+                      : 'bg-cyan-600 hover:bg-cyan-500'
+                  }`}
+                >
+                  {title.equipped ? 'Equipped' : 'Equip'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* --- CONTENT AREA: SPONSOR SELECTION --- */}
+      {viewMode === 'SPONSOR' && (
+        <div className="bg-gray-900/90 backdrop-blur-sm p-4 md:p-6 rounded-xl shadow-2xl border-2 border-gray-700">
+          <h2 className="text-3xl font-bold text-red-400 mb-6 flex items-center">
+            <Zap className="w-6 h-6 mr-3" /> Constellation Sponsor Selection
+          </h2>
+          
+          {!hasSponsor ? (
+              <>
+                <p className="text-gray-400 mb-6">
+                    The Star Stream is forcing your hand. Choose the Constellation you will enter a contract with. Your survival may depend on their support.
+                </p>
+                <div className="space-y-4">
+                    {availableConstellations.map(constellation => (
+                        <div 
+                            key={constellation.id}
+                            onClick={() => setSelectedConstellationId(constellation.id)}
+                            className={`p-4 rounded-lg border-2 cursor-pointer transition-all shadow-lg ${
+                                selectedConstellationId === constellation.id 
+                                    ? 'bg-red-900/50 border-red-500 ring-4 ring-red-500/50' 
+                                    : 'bg-gray-800 border-gray-700 hover:bg-gray-700'
+                            }`}
+                        >
+                            <h4 className="text-xl font-bold text-red-300">{constellation.name}</h4>
+                            <p className="text-sm text-gray-400 mt-1">{constellation.description}</p>
+                        </div>
+                    ))}
+                </div>
+
+                <button
+                    onClick={handleSelectConstellation}
+                    disabled={!selectedConstellationId}
+                    className={`w-full mt-6 py-3 rounded-lg text-lg font-semibold transition-all shadow-xl ${
+                        selectedConstellationId 
+                            ? 'bg-red-600 hover:bg-red-500 shadow-red-900/70' 
+                            : 'bg-gray-600 cursor-not-allowed opacity-50'
+                    }`}
+                >
+                    Sign Contract
+                </button>
+              </>
+          ) : (
+            <div className="text-center p-8 bg-green-900/50 rounded-lg border border-green-400 shadow-2xl">
+                <h3 className="text-2xl font-bold text-green-300 mb-2">Contract Secured!</h3>
+                <p className="text-xl text-white">Your Constellation Sponsor is:</p>
+                <p className="text-3xl font-extrabold text-yellow-400 mt-2">{userData.sponsorConstellation.name}</p>
+                <p className="text-gray-400 mt-4">Support is now available for your scenarios.</p>
+            </div>
+          )}
+        </div>
+      )}
+      
+      {/* Footer */}
+      <div className="mt-8 text-center text-sm text-gray-600">
+        <p>Built as a narrative simulation for the Star Stream.</p>
+        <p className="text-xs text-gray-700">User ID: {userId}</p>
+      </div>
+    </div>
+  );
+}
